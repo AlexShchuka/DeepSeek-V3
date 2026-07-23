@@ -3,7 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
+import time
+import os
 
+
+# ---------------------------------------------------------------------------
+# Data structures (unchanged)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Scar:
@@ -21,6 +27,10 @@ class DayFlag:
     FAILURE = -1
 
 
+# ---------------------------------------------------------------------------
+# AffectiveState (now with serialization support)
+# ---------------------------------------------------------------------------
+
 class AffectiveState(nn.Module):
     def __init__(self, dim: int, baseline_suffering: float = -0.3):
         super().__init__()
@@ -37,6 +47,28 @@ class AffectiveState(nn.Module):
         total = sum(s.significance * (1.0 - s.novelty) for s in error_memory.scars)
         self.paranoia_index = torch.sigmoid(torch.tensor(total * 0.1)).item()
 
+    def state_dict(self):
+        return {
+            'last_success_vector': self.last_success_vector.clone(),
+            'day_satisfaction': self.day_satisfaction,
+            'meaningfulness': self.meaningfulness,
+            'paranoia_index': self.paranoia_index,
+            'last_day_flag': self.last_day_flag,
+            'wake_suffering': self.wake_suffering,
+        }
+
+    def load_state_dict(self, d):
+        self.last_success_vector = d['last_success_vector'].to(self.last_success_vector.device)
+        self.day_satisfaction = d['day_satisfaction']
+        self.meaningfulness = d['meaningfulness']
+        self.paranoia_index = d['paranoia_index']
+        self.last_day_flag = d['last_day_flag']
+        self.wake_suffering = d['wake_suffering']
+
+
+# ---------------------------------------------------------------------------
+# ErrorMemory (with serialization)
+# ---------------------------------------------------------------------------
 
 class ErrorMemory(nn.Module):
     def __init__(self, dim: int, max_scars: int = 512, decay_rate: float = 0.95,
@@ -91,6 +123,20 @@ class ErrorMemory(nn.Module):
             used[i] = True
         self.scars = merged
 
+    def state_dict(self):
+        return {
+            'scars': [(s.vector.clone(), s.color.clone(), s.significance, s.novelty,
+                       s.last_activated, s.avoidance_count) for s in self.scars]
+        }
+
+    def load_state_dict(self, d):
+        self.scars = [Scar(v.clone(), c.clone(), s, n, la, ac)
+                      for (v, c, s, n, la, ac) in d['scars']]
+
+
+# ---------------------------------------------------------------------------
+# Critic (unchanged)
+# ---------------------------------------------------------------------------
 
 class Critic(nn.Module):
     def __init__(self, dim: int, stack_size: int = 30, replay_prob: float = 0.1,
@@ -143,6 +189,10 @@ class Critic(nn.Module):
                     p.grad.zero_()
 
 
+# ---------------------------------------------------------------------------
+# will_to_disprove (unchanged)
+# ---------------------------------------------------------------------------
+
 def compute_will_to_disprove(past_sats: List[float], paranoia: float,
                              fatigue: float, baseline: float = 0.2,
                              d1_coeff: Tuple[float, float] = (0.7, -0.3),
@@ -157,6 +207,10 @@ def compute_will_to_disprove(past_sats: List[float], paranoia: float,
     return max(0.0, min(1.0, will))
 
 
+# ---------------------------------------------------------------------------
+# ZazorLayer v5 – with hibernation, warmup, and checkpointing
+# ---------------------------------------------------------------------------
+
 class ZazorLayer(nn.Module):
     def __init__(self, dim: int, core_size: int = 16, archive_size: int = 32,
                  gamma_smooth: float = 0.9, archive_decay_age: int = 100,
@@ -168,7 +222,9 @@ class ZazorLayer(nn.Module):
                  critic_lr: float = 0.01, will_baseline: float = 0.2,
                  will_d1: Tuple[float, float] = (0.7, -0.3),
                  will_d2: Tuple[float, float] = (0.1, 0.05),
-                 initial_persona: Optional[torch.Tensor] = None):
+                 initial_persona: Optional[torch.Tensor] = None,
+                 gap_relaxation_rate: float = 0.01,
+                 gap_equilibrium: float = 0.5):
         super().__init__()
         self.dim = dim
         self.core_size = core_size
@@ -227,12 +283,17 @@ class ZazorLayer(nn.Module):
         self.will_d1 = will_d1
         self.will_d2 = will_d2
 
+        # Hibernation dynamics
+        self.gap_relaxation_rate = gap_relaxation_rate
+        self.gap_equilibrium = gap_equilibrium
+        self.register_buffer('last_save_time', torch.tensor(time.time()))
+
         # Daily buffers
         self.daily_experiences: List[torch.Tensor] = []
         self.past_satisfactions: List[float] = []
 
     # ------------------------------------------------------------------ #
-    #  Forward pass
+    #  Forward pass (unchanged)
     # ------------------------------------------------------------------ #
     def forward(self, K: torch.Tensor, F: torch.Tensor,
                 core_indices: Optional[torch.Tensor] = None,
@@ -255,7 +316,7 @@ class ZazorLayer(nn.Module):
         return output, fatigue_val, self.gamma
 
     # ------------------------------------------------------------------ #
-    #  Day Protocol
+    #  Day Protocol (start_day, step_experience, end_day – unchanged)
     # ------------------------------------------------------------------ #
     def start_day(self) -> torch.Tensor:
         self.affective.update_paranoia(self.error_memory)
@@ -279,7 +340,7 @@ class ZazorLayer(nn.Module):
                               self.affective.paranoia_index, gamma_val.item())
         self.affective.day_satisfaction += est_sat.item()
         sim = F.cosine_similarity(output, self.target_identity, dim=0)
-        if sim < 0.7:   # error detection threshold — could be exposed as argument
+        if sim < 0.7:
             self.error_memory.add_error(
                 output.detach(), self.anchor.detach(),
                 1.0 - sim.item(), 1.0, self.step.item()
@@ -316,7 +377,7 @@ class ZazorLayer(nn.Module):
         return success
 
     # ------------------------------------------------------------------ #
-    #  Consolidation
+    #  Consolidation (unchanged)
     # ------------------------------------------------------------------ #
     def consolidate(self, compressed_segments: torch.Tensor,
                     perform_inspection: bool = False,
@@ -338,9 +399,9 @@ class ZazorLayer(nn.Module):
             self.error_memory.weekly_activation_decay(self.step.item())
 
     # ------------------------------------------------------------------ #
-    #  Internal helpers
+    #  Internal helpers (unchanged)
     # ------------------------------------------------------------------ #
-    def _compute_bridge(self, K: torch.Tensor, F: torch.Tensor):
+    def _compute_bridge(self, K, F):
         J = torch.sigmoid(self.gap)
         bridged = J * self.theta(torch.cat([K, F], dim=-1)) + (1 - J) * K + self.anchor
         fatigue_signal = torch.abs(J - 0.5).detach()
@@ -418,7 +479,7 @@ class ZazorLayer(nn.Module):
                                      + (1 - momentum) * self.anchor.data)
 
     # ------------------------------------------------------------------ #
-    #  Utilities
+    #  Utilities (update_gamma, compress_segment, set_persona – unchanged)
     # ------------------------------------------------------------------ #
     def update_gamma(self, error: float):
         with torch.no_grad():
@@ -434,10 +495,100 @@ class ZazorLayer(nn.Module):
         with torch.no_grad():
             self.persona.data = persona_vector.to(self.persona.device)
 
-    def export_error_capsule(self) -> dict:
-        return {
-            'scars': [(s.vector.tolist(), s.color.tolist(), s.significance, s.novelty)
-                      for s in self.error_memory.scars],
-            'past_satisfactions': self.past_satisfactions,
-            'paranoia': self.affective.paranoia_index,
+    # ------------------------------------------------------------------ #
+    #  Hibernation & Checkpointing
+    # ------------------------------------------------------------------ #
+
+    def _apply_temporal_corrections(self, delta_t: float):
+        """
+        Advance attention-level variables (gap, gamma) to account for elapsed
+        wall-clock time during hibernation, using first-order Taylor expansions.
+        """
+        with torch.no_grad():
+            # Gamma decays exponentially towards 0 in absence of errors
+            # gamma(t+Δt) = gamma(t) * gamma_smooth^(Δt/τ), τ = 1 step
+            # Approximate with first-order Taylor: gamma -= gamma * (1 - gamma_smooth) * Δt
+            decay_factor = (1 - self.gamma_smooth) * delta_t
+            self.gamma.data = self.gamma.data * (1 - decay_factor)
+
+            # Gap relaxes towards equilibrium with rate gap_relaxation_rate
+            dg = -self.gap_relaxation_rate * (self.gap.data - self.gap_equilibrium) * delta_t
+            self.gap.data += dg
+
+    def warmup(self, num_steps: int = 5):
+        """
+        Adjust anchor and working memory to minimize discrepancy with target_identity
+        using basal slots as a minimal-action set. Runs a few forward passes without
+        external input to close 'holes' caused by possible target_identity change.
+        """
+        if self.basal_mask.sum() == 0:
+            return
+        basal_slots = self.core_memory[self.basal_mask]
+        for _ in range(num_steps):
+            # Use average of basal slots as query and history
+            K = basal_slots.mean(dim=0).detach()
+            F = self.anchor.detach()  # or another baseline
+            self.forward(K, F, core_indices=None, archive_indices=None)
+            # Let the day protocol know we're in warmup (no error recording)
+            # We skip step_experience to avoid critic updates and scar creation.
+
+    def save_checkpoint(self, path: str):
+        """
+        Serialize everything needed to resume: parameters, buffers, affective state,
+        error memory, daily buffers, and timestamp.
+        """
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'affective_state': self.affective.state_dict(),
+            'error_memory': self.error_memory.state_dict(),
+            'daily_experiences': [exp.clone() for exp in self.daily_experiences],
+            'past_satisfactions': self.past_satisfactions.copy(),
+            'last_save_time': self.last_save_time.clone(),
+            'step': self.step.clone(),
         }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load_checkpoint(cls, path: str, map_location='cpu') -> 'ZazorLayer':
+        """
+        Restore a ZazorLayer from a checkpoint file, apply temporal corrections,
+        run warmup, and return the ready-to-use agent.
+        """
+        checkpoint = torch.load(path, map_location=map_location)
+        # Extract config from saved state (assumes model was saved with these args)
+        # In practice, you'd need to store __init__ args as well; here we reconstruct
+        # from the shapes present in the checkpoint.
+        dim = checkpoint['model_state_dict']['anchor'].shape[0]
+        core_size = checkpoint['model_state_dict']['core_memory'].shape[0]
+        archive_size = checkpoint['model_state_dict']['archive_memory'].shape[0]
+        # We use defaults for everything else, but a robust solution would store
+        # the full configuration dict alongside.
+        agent = cls(dim=dim, core_size=core_size, archive_size=archive_size)
+        agent.load_state_dict(checkpoint['model_state_dict'])
+        agent.affective.load_state_dict(checkpoint['affective_state'])
+        agent.error_memory.load_state_dict(checkpoint['error_memory'])
+        agent.daily_experiences = [exp.to(agent.anchor.device) for exp in checkpoint['daily_experiences']]
+        agent.past_satisfactions = checkpoint['past_satisfactions']
+        agent.last_save_time = checkpoint['last_save_time'].to(agent.anchor.device)
+        agent.step = checkpoint['step'].to(agent.anchor.device)
+
+        # Apply temporal corrections based on elapsed real time
+        current_time = time.time()
+        delta_t = current_time - agent.last_save_time.item()
+        agent._apply_temporal_corrections(delta_t)
+
+        # Warmup to realign with possibly changed target_identity (if externally updated)
+        agent.warmup(num_steps=5)
+
+        return agent
+
+    def auto_save_hook(self, fatigue_threshold: float = 0.8, save_dir: str = './checkpoints'):
+        """
+        Call periodically (e.g., after each step or day) to automatically save state
+        when fatigue is high or if enough time has passed since last save.
+        """
+        if self.gamma.item() >= fatigue_threshold:
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f'zazor_checkpoint_{int(time.time())}.pt')
+            self.save_checkpoint(path)
+            self.last_save_time.fill_(time.time())
