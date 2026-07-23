@@ -1,8 +1,3 @@
-"""
-ZazorLayer — continuous memory with affective daily protocol, error memory,
-and critic-based satisfaction estimation.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
