@@ -6,6 +6,41 @@ from dataclasses import dataclass, field
 import time
 import os
 import math
+from enum import IntEnum
+
+
+class ErrorType(IntEnum):
+    TRAUMA = 1
+    GAP = 2
+    IDENTITY = 3
+    NOVELTY = 4
+    OTHER = 5
+
+
+_ERROR_TAG_MAP = [
+    (lambda core_idx, sim, gap, gap_eq, cos_per_target: core_idx is not None and sim < 0.7, ErrorType.TRAUMA),
+    (lambda core_idx, sim, gap, gap_eq, cos_per_target: gap.item() > gap_eq and sim < 0.7, ErrorType.GAP),
+    (lambda core_idx, sim, gap, gap_eq, cos_per_target: cos_per_target < 0.5, ErrorType.IDENTITY),
+]
+
+
+@dataclass
+class ErrorInfluenceConfig:
+    alpha_mod: float = 1.5
+    paranoia_mod: float = 0.2
+    drift_corr_mod: float = 0.5
+
+    @staticmethod
+    def default_for(tag: ErrorType):
+        defaults = {
+            ErrorType.TRAUMA:    (1.5, 0.2, 0.5),
+            ErrorType.GAP:       (1.0, 0.1, 1.0),
+            ErrorType.IDENTITY:  (2.0, 0.3, 2.0),
+            ErrorType.NOVELTY:   (0.8, 0.05, 0.2),
+            ErrorType.OTHER:     (1.0, 0.1, 0.5),
+        }
+        a, p, d = defaults.get(tag, defaults[ErrorType.OTHER])
+        return ErrorInfluenceConfig(alpha_mod=a, paranoia_mod=p, drift_corr_mod=d)
 
 
 @dataclass
@@ -30,6 +65,7 @@ class WillConfig:
     baseline: float = 0.2
     d1_coeff: Tuple[float, float] = (0.7, -0.3)
     d2_coeff: Tuple[float, float] = (0.1, 0.05)
+    drift_coeff: float = 0.3
 
 
 @dataclass
@@ -46,6 +82,7 @@ class ZazorConfig:
     gap_relaxation_rate: float = 0.01
     gap_equilibrium: float = 0.5
     error_memory: ErrorMemoryConfig = field(default_factory=ErrorMemoryConfig)
+    error_influence: ErrorInfluenceConfig = field(default_factory=lambda: ErrorInfluenceConfig())
     critic: CriticConfig = field(default_factory=CriticConfig)
     will: WillConfig = field(default_factory=WillConfig)
     time_provider: Optional[Callable[[], float]] = None
@@ -74,13 +111,15 @@ class DummyBodyBuffer:
 
 
 class Scar:
-    def __init__(self, vector, color, significance, novelty, last_activated, involved_core_indices=None):
+    def __init__(self, vector, color, significance, novelty, last_activated,
+                 involved_core_indices=None, error_type=ErrorType.OTHER):
         self.vector = vector
         self.color = color
         self.significance = significance
         self.novelty = novelty
         self.last_activated = last_activated
         self.involved_core_indices = involved_core_indices or []
+        self.error_type = error_type
 
 
 class CycleFlag:
@@ -144,13 +183,14 @@ class Critic:
         return math.exp(-sum(self.recent_errors)/len(self.recent_errors))
 
 
-def compute_will_to_disprove(past_sats, paranoia, fatigue, baseline, d1_coeff, d2_coeff):
+def compute_will_to_disprove(past_sats, paranoia, fatigue, baseline, d1_coeff, d2_coeff, drift_coeff, drift_tension):
     if not past_sats: return 0.0
     weights = torch.softmax(torch.arange(1,len(past_sats)+1,dtype=torch.float32),dim=0)
     state = sum(w*s for w,s in zip(weights.tolist(),past_sats))
     d1 = d1_coeff[0]*(1-paranoia) + d1_coeff[1]*fatigue
     d2 = d2_coeff[0]*(1-paranoia) + d2_coeff[1]*fatigue
-    return max(0.0, min(1.0, baseline + d1*state + 0.5*d2*state**2))
+    raw = baseline + d1*state + 0.5*d2*state**2 - drift_coeff*drift_tension
+    return max(0.0, min(1.0, raw))
 
 
 class MetaModulator(nn.Module):
@@ -161,8 +201,8 @@ class MetaModulator(nn.Module):
         self.register_buffer('ema', torch.zeros(9,dim))
         self.ema[1]=0.9; self.ema[4]=1/math.sqrt(2); self.ema[5]=1.0; self.ema[7]=0.1; self.ema[8]=0.995
         self.alpha = nn.Parameter(torch.tensor(0.9))
-    def forward(self, t, m, gap, gamma):
-        ctx = torch.tensor([t,m,gap.item(),gamma.item()], device=self.proj.weight.device)
+    def forward(self, t, m, drift_tension, gamma):
+        ctx = torch.tensor([t,m,drift_tension.item(),gamma.item()], device=self.proj.weight.device)
         raw = self.proj(self.encoder(ctx)).view(9,-1)
         raw[1:5].sigmoid_(); raw[5] = F.softplus(raw[5])+0.5; raw[6:9].sigmoid_()
         a = torch.sigmoid(self.alpha)
@@ -194,6 +234,7 @@ class ZazorLayer(nn.Module):
         self.scars: List[Scar] = []
         self.critic = Critic(dim, config.critic)
         self.will_b=config.will.baseline; self.will_d1=config.will.d1_coeff; self.will_d2=config.will.d2_coeff
+        self.will_drift=config.will.drift_coeff
         self.gap_lr=config.gap_relaxation_rate; self.gap_eq=config.gap_equilibrium
         self.drift_base=config.drift_threshold_base; self.int_alpha=config.interference_alpha
         self.mig_f=config.migration_age_factor; self.arch_age=config.archive_decay_age_seconds
@@ -208,12 +249,35 @@ class ZazorLayer(nn.Module):
         self.now = self._t()
 
     def _t(self): return self.cfg.time_provider() if self.cfg.time_provider else time.time()
+
     @property
-    def persona(self): return self.mem[self.is_core].mean(0) if self.is_core.any() else self.anchor
+    def drift_tension(self):
+        """Мгновенное напряжение идентичности: 0 – согласованность, 1 – полный разлад."""
+        p = self.persona
+        return (1-F.cosine_similarity(self.anchor, p, dim=0)) * \
+               (1-F.cosine_similarity(p, self.target, dim=0)) * \
+               (1-F.cosine_similarity(self.anchor, self.target, dim=0))
+
+    @property
+    def persona(self):
+        core = self.mem[self.is_core]
+        if not core.shape[0]:
+            return self.anchor
+        ages = self.now - self.last_acc[self.is_core]
+        weights = F.softmax(-ages, dim=0)
+        raw = (core * weights.unsqueeze(-1)).sum(0)
+        beta = torch.sigmoid(self.drift_tension)
+        return (1-beta)*raw + beta*(self.anchor + self.target)/2
 
     def _mp(self):
         t = self.trauma[self.is_core].mean().item()
-        return self.meta(t, self.aff.meaningfulness, self.gap, self.gamma)
+        return self.meta(t, self.aff.meaningfulness, self.drift_tension, self.gamma)
+
+    def _deduce_error_type(self, core_idx, sim, cos_per_target):
+        for predicate, tag in _ERROR_TAG_MAP:
+            if predicate(core_idx, sim, self.gap, self.gap_eq, cos_per_target):
+                return tag
+        return ErrorType.NOVELTY
 
     def start_fast_cycle(self):
         self.now = self._t(); self.aff.update_paranoia(self.scars)
@@ -239,7 +303,9 @@ class ZazorLayer(nn.Module):
         sim = F.cosine_similarity(out, self.target, dim=0)
         mp = self._mp()
         if core_idx is not None and sim<0.7:
-            self._add_error(out.detach(), self.anchor.detach(), 1-sim.item(), 1.0, self.now, core_idx.tolist())
+            cos_per_target = F.cosine_similarity(self.persona, self.target, dim=0).item()
+            error_type = self._deduce_error_type(core_idx, sim, cos_per_target)
+            self._add_error(out.detach(), self.anchor.detach(), 1-sim.item(), 1.0, self.now, core_idx.tolist(), error_type)
             nov = 1-F.cosine_similarity(out.detach().unsqueeze(0), self.mem[core_idx])
             t = self.trauma[core_idx]
             gain = (1-t)*torch.clamp(nov-t,min=0)*torch.sigmoid(torch.mv(self.mem[core_idx],mp[3]))
@@ -290,7 +356,8 @@ class ZazorLayer(nn.Module):
             lr=torch.sigmoid(torch.tensor(self.aff.meaningfulness))*(1-self.gamma)
             self.mem[wmask]=(1-lr)*self.mem[wmask]+lr*agg[wmask]
         final_sat=F.cosine_similarity(agg.mean(0),self.target,dim=0).item()
-        will=compute_will_to_disprove(self.sat_hist,self.aff.paranoia_index,self.gamma.item(),self.will_b,self.will_d1,self.will_d2)
+        will=compute_will_to_disprove(self.sat_hist,self.aff.paranoia_index,self.gamma.item(),
+                                      self.will_b,self.will_d1,self.will_d2,self.will_drift,self.drift_tension)
         empty=(X.shape[0]==1 and X[0].sum()==0)
         success=final_sat>0 and will>0.5 and not empty
         self.aff.last_cycle_flag=CycleFlag.EMPTY if empty else (CycleFlag.SUCCESS if success else CycleFlag.FAILURE)
@@ -318,11 +385,26 @@ class ZazorLayer(nn.Module):
         self._inspect(); self._migrate(); self._decay_arch(); self._update_target(); self._scar_decay()
         self.trauma*=(1-self.aff.meaningfulness*(1-self.aff.paranoia_index))
 
+    def _active_scar_modifiers(self):
+        """Возвращает максимальные модификаторы из недавних шрамов."""
+        cutoff = self.now - self.err_cfg.slow_cycle_seconds
+        active = [s for s in self.scars if s.last_activated >= cutoff]
+        if not active:
+            return ErrorInfluenceConfig()  # нейтральные значения
+        tags = set(s.error_type for s in active)
+        configs = [ErrorInfluenceConfig.default_for(t) for t in tags]
+        return ErrorInfluenceConfig(
+            alpha_mod=max(c.alpha_mod for c in configs),
+            paranoia_mod=max(c.paranoia_mod for c in configs),
+            drift_corr_mod=max(c.drift_corr_mod for c in configs),
+        )
+
     def _inspect(self):
         target=self.target.data
         pa=torch.sigmoid(F.cosine_similarity(self.persona,target,dim=0))
         thresh=self.drift_base*(1+pa)*(1+self.gamma)
-        alpha=self.int_alpha*(1-self.aff.paranoia_index)
+        infl = self._active_scar_modifiers()
+        alpha=self.int_alpha*infl.alpha_mod*(1-self.aff.paranoia_index)
         core_idx=self.is_core.nonzero(as_tuple=True)[0]
         nb=core_idx[core_idx>=self.cfg.num_basal_slots]
         if not len(nb): return
@@ -332,6 +414,9 @@ class ZazorLayer(nn.Module):
             idx=nb[mask]
             self.mem[idx]+=alpha*(target.unsqueeze(0)-self.mem[idx])
             self.sacred[idx]*=0.9
+        # влияние на паранойю
+        if infl.paranoia_mod > 0:
+            self.aff.paranoia_index = min(1.0, self.aff.paranoia_index + infl.paranoia_mod*0.1)
 
     def _migrate(self):
         nb=(self.is_core.nonzero(as_tuple=True)[0])[self.is_core.nonzero(as_tuple=True)[0]>=self.cfg.num_basal_slots]
@@ -370,10 +455,10 @@ class ZazorLayer(nn.Module):
         smooth=getattr(self,'_gamma_smooth',0.9)
         with torch.no_grad(): self.gamma.data=smooth*self.gamma.data+(1-smooth)*error
 
-    def _add_error(self, vec,col,sig,nov,ts,idx):
+    def _add_error(self, vec, col, sig, nov, ts, idx, error_type=ErrorType.OTHER):
         if len(self.scars)>=self.err_cfg.max_scars:
             self.scars.sort(key=lambda s:s.significance); self.scars.pop(0)
-        self.scars.append(Scar(vec.clone(),col.clone(),sig,nov,ts,idx))
+        self.scars.append(Scar(vec.clone(), col.clone(), sig, nov, ts, idx, error_type))
 
     def _scar_decay(self):
         for s in self.scars:
@@ -398,7 +483,9 @@ class ZazorLayer(nn.Module):
                 sig=max(g.significance for g in grp); nov=min(g.novelty for g in grp)
                 last=max(g.last_activated for g in grp)
                 idx=list(set(i for g in grp for i in g.involved_core_indices))
-                merged.append(Scar(avg_v,avg_c,sig,nov,last,idx))
+                # тег наследуется от наиболее значимого шрама
+                main = max(grp, key=lambda g: g.significance)
+                merged.append(Scar(avg_v, avg_c, sig, nov, last, idx, main.error_type))
             else: merged.append(s)
         self.scars=merged
 
@@ -417,7 +504,8 @@ class ZazorLayer(nn.Module):
     def save_checkpoint(self, path):
         ck={
             'config':self.cfg,'state':self.state_dict(),'affect':self.aff.state_dict(),
-            'scars':[(s.vector,s.color,s.significance,s.novelty,s.last_activated,s.involved_core_indices.copy()) for s in self.scars],
+            'scars':[(s.vector,s.color,s.significance,s.novelty,s.last_activated,
+                       s.involved_core_indices.copy(), s.error_type) for s in self.scars],
             'sat_hist':self.sat_hist.copy(),'now':self.now,'ts':self._t(),
             'g_smooth':getattr(self,'_gamma_smooth',0.9),
             'body':self.body.get_anchor_history().clone() if hasattr(self.body,'get_anchor_history') else None
@@ -430,7 +518,12 @@ class ZazorLayer(nn.Module):
         if time_provider: cfg.time_provider=time_provider
         agent=cls(cfg,body_buffer=body_buffer)
         agent.load_state_dict(ck['state']); agent.aff.load_state_dict(ck['affect'])
-        agent.scars=[Scar(v.clone() if isinstance(v,torch.Tensor) else v, c.clone() if isinstance(c,torch.Tensor) else c, s,n,la, idx.copy() if isinstance(idx,list) else idx) for (v,c,s,n,la,idx) in ck['scars']]
+        agent.scars=[Scar(v.clone() if isinstance(v,torch.Tensor) else v,
+                           c.clone() if isinstance(c,torch.Tensor) else c,
+                           s,n,la,
+                           idx.copy() if isinstance(idx,list) else idx,
+                           et if isinstance(et,ErrorType) else ErrorType(et))
+                     for (v,c,s,n,la,idx,et) in ck['scars']]
         agent.sat_hist=ck['sat_hist']; agent.now=ck['now']; agent._gamma_smooth=ck.get('g_smooth',0.9)
         if body_buffer is None and ck.get('body') is not None: agent.body.buffer=ck['body'].clone()
         cur=resume_time or agent._t(); dt=cur-ck['ts']
