@@ -1,161 +1,79 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Callable
-from dataclasses import dataclass, field
-import math
+from typing import Optional, Tuple
 
-@dataclass
-class AgeConfig:
-    delta_t: float = 0.01
-    beta_young: float = 0.1
-    lambda_penalty: float = 0.05
-    gamma_penalty_scale: float = 0.1
-
-@dataclass
-class ErrorSheafConfig:
-    max_scars: int = 512
-    similarity_threshold: float = 0.9
-    attraction_eps: float = 0.01
-    decay_significance: float = 0.99
-    novelty_lr: float = 0.1
-
-@dataclass
-class CohomologyConfig:
-    alpha_drift: float = 0.25
-    alpha_trauma: float = 0.25
-    alpha_variance: float = 0.25
-    alpha_gap: float = 0.25
-    gamma_temperature: float = 0.1
-    alpha_delta_mod: float = 0.5
-
-@dataclass
-class MixerConfig:
-    hidden_dim: int = 64
-    num_layers: int = 2
-
-@dataclass
+# ------------------------------------------------------------
+# Конфигурация (минимальная)
+# ------------------------------------------------------------
 class ZazorConfig:
-    dim: int
-    core_size: int = 16
-    archive_size: int = 32
-    num_basal_slots: int = 4
-    initial_persona: Optional[torch.Tensor] = None
-    age: AgeConfig = field(default_factory=AgeConfig)
-    error_sheaf: ErrorSheafConfig = field(default_factory=ErrorSheafConfig)
-    cohomology: CohomologyConfig = field(default_factory=CohomologyConfig)
-    mixer: MixerConfig = field(default_factory=MixerConfig)
-    time_provider: Optional[Callable[[], float]] = None
-    warmup_steps: int = 5
-
-def compute_context(K, F, anchor, gap, theta):
-    bridged = torch.sigmoid(gap) * theta(torch.cat([K, F])) + (1 - torch.sigmoid(gap)) * K + anchor
-    return bridged
-
-def boundary_1(ctx, C1, is_basal, temperature, basal_bonus, gamma, paranoia, ages):
-    logits = (ctx @ C1.T) / temperature
-    crisis_bonus = is_basal.float() * basal_bonus * ((1 - gamma) + paranoia)
-    attn = torch.softmax(logits + crisis_bonus, dim=-1)
-    mem_contrib = attn @ C1
-    freshness = torch.exp(-ages * (1 + gamma))
-    return mem_contrib, attn, freshness
-
-def gate_mix(ctx, mem_contrib, gate_W, gamma, paranoia, avg_sacred, novelty):
-    confidence_mem = avg_sacred * (1 - paranoia) * gamma
-    confidence_ctx = (1 - gamma) * (1 + paranoia) * novelty
-    logit_mod = torch.log(confidence_mem / (confidence_ctx + 1e-8))
-    raw = gate_W(torch.cat([ctx, mem_contrib]))
-    gate = torch.sigmoid(raw + logit_mod)
-    return gate * mem_contrib + (1 - gate) * ctx
-
-def update_C1(C1, C0, attn, lr, trust, is_basal, basal_lr):
-    sim = F.cosine_similarity(C0.unsqueeze(0), C1, dim=-1)
-    lr_effective = torch.where(is_basal, basal_lr * trust, lr * trust)
-    delta = lr_effective.unsqueeze(-1) * attn.unsqueeze(-1) * (C0.unsqueeze(0) - C1) * sim.unsqueeze(-1)
-    return C1 + delta
-
-def update_C2(C2, C1, ages, trauma, sacred_eff, mig_thresh, ages_arch, C0):
-    priority = ages / (1 + sacred_eff + 1e-8)
-    p_mig = torch.sigmoid(priority - mig_thresh)
-    w_arch = torch.softmax(ages_arch, dim=0)
-    target_arch = w_arch @ C2
-    delta_C2 = p_mig.unsqueeze(-1) * (C1 - target_arch.unsqueeze(0))  # (core, d)
-    C2 = C2 + w_arch.unsqueeze(-1) * delta_C2.mean(dim=0)  # упрощённо
-    C1 = C1 * (1 - p_mig.unsqueeze(-1)) + p_mig.unsqueeze(-1) * C0.unsqueeze(0)
-    return C1, C2
-
-def update_trauma(trauma, novelty, heal, gain_scale, heal_scale):
-    gain = (1 - trauma) * F.relu(novelty - trauma) * gain_scale
-    heal = (1 - trauma) * F.relu(heal) * heal_scale
-    return trauma + gain - heal * trauma
-
-def update_ages(ages, attn, sim, gamma, cfg):
-    aging = cfg.delta_t * (1 + cfg.gamma_penalty_scale * (1 - gamma))
-    rejuvenation = cfg.beta_young * sim * (1 + gamma)
-    penalty = cfg.lambda_penalty * (1 - attn) * gamma
-    ages = ages + aging - rejuvenation + penalty
-    return torch.clamp(ages, min=0.0)
-
-def update_sacred(mu, sigma2, attn, TD_error, trust, bias):
-    precision = 1.0 / (sigma2 + 1e-8)
-    attn_abs = attn.abs()
-    new_precision = precision + trust * attn_abs
-    new_mu = (precision * mu + trust * attn_abs * TD_error) / (new_precision + 1e-8)
-    new_sigma2 = 1.0 / (new_precision + 1e-8)
-    effective = new_mu + bias
-    return new_mu, new_sigma2, effective
-
-def update_error_sheaf(S, sig, nov, anchor, cfg):
-    sim = F.cosine_similarity(anchor.unsqueeze(0), S, dim=-1)
-    nov = nov - cfg.novelty_lr * (1 - sim)
-    sig = sig * cfg.decay_significance
-    S_sim = S @ S.T
-    mask = (S_sim > cfg.similarity_threshold).float() - torch.eye(S.size(0), device=S.device)
-    attraction = cfg.attraction_eps * (mask @ S - S * mask.sum(dim=1, keepdim=True))
-    S = S + attraction
-    return S, sig, nov
-
-def compute_gamma(drift_tension, trauma_mean, gap, avg_variance, critic_error, avg_sacred, cfg):
-    mod = cfg.alpha_delta_mod / (1 + avg_sacred)
-    raw = 1.0 - mod * critic_error - cfg.alpha_drift * drift_tension - cfg.alpha_trauma * trauma_mean \
-          - cfg.alpha_variance * avg_variance - cfg.alpha_gap * gap
-    return torch.sigmoid(raw / cfg.gamma_temperature)
-
-class Mixer(nn.Module):
-    def __init__(self, dim, core_size, archive_size, cfg):
-        super().__init__()
+    def __init__(self, dim: int, core_size: int = 16, archive_size: int = 32,
+                 num_basal: int = 4, basal_dim: int = 4):
         self.dim = dim
         self.core_size = core_size
         self.archive_size = archive_size
-        input_dim = 7
-        layers = []
-        prev = input_dim
-        for _ in range(cfg.num_layers):
-            layers.append(nn.Linear(prev, cfg.hidden_dim))
-            layers.append(nn.ReLU())
-            prev = cfg.hidden_dim
-        self.backbone = nn.Sequential(*layers)
+        self.num_basal = num_basal
+        self.basal_dim = basal_dim  # размерность аффективного выхода
+        # Параметры энергии
+        self.alpha_coh = 1.0
+        self.alpha_work = 0.5
+        self.alpha_reg = 0.01
+        self.alpha_barrier = 10.0
+        self.barrier_drift = 0.5
+        self.barrier_paranoia = 0.5
+        # Оптимизация
+        self.inner_gamma_steps = 3
+        self.gamma_lr = 0.01
+        self.base_lr = 0.001
 
-        self.head_lr_C1 = nn.Linear(prev, core_size)
-        self.head_temperature = nn.Linear(prev, 1)
-        self.head_mom_a = nn.Linear(prev, 1)
-        self.head_mom_t = nn.Linear(prev, 1)
-        self.head_mig_thresh = nn.Linear(prev, 1)
-        self.head_gain_scale = nn.Linear(prev, dim)
-        self.head_heal_scale = nn.Linear(prev, dim)
-        self.head_basal_bonus = nn.Linear(prev, 1)
-        self.head_basal_lr = nn.Linear(prev, 1)
+# ------------------------------------------------------------
+# Вспомогательные слои
+# ------------------------------------------------------------
+class Theta(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Linear(2 * dim, dim)
+    def forward(self, K, F):
+        return self.net(torch.cat([K, F], dim=-1))
 
-    def forward(self, cohomology):
-        h = self.backbone(cohomology)
+class Gate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.W = nn.Linear(2 * dim, dim)
+    def forward(self, ctx, mem_contrib, confidence_mem, confidence_ctx):
+        logit_mod = torch.log(confidence_mem / (confidence_ctx + 1e-8))
+        raw = self.W(torch.cat([ctx, mem_contrib], dim=-1))
+        gate = torch.sigmoid(raw + logit_mod)
+        return gate * mem_contrib + (1 - gate) * ctx
+
+class Mixer(nn.Module):
+    def __init__(self, dim, core_size):
+        super().__init__()
+        input_dim = 6  # drift, trauma_mean, gap, avg_variance, critic_error, avg_sacred
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU()
+        )
+        self.head_lr = nn.Linear(64, core_size)
+        self.head_temp = nn.Linear(64, 1)
+        self.head_mom_a = nn.Linear(64, 1)
+        self.head_mom_t = nn.Linear(64, 1)
+        self.head_mig = nn.Linear(64, 1)
+        self.head_gain = nn.Linear(64, dim)
+        self.head_heal = nn.Linear(64, dim)
+        self.head_basal_bonus = nn.Linear(64, 1)
+        self.head_basal_lr = nn.Linear(64, 1)
+
+    def forward(self, coh):
+        h = self.net(coh)
         return {
-            'lr_C1': torch.sigmoid(self.head_lr_C1(h)) * 0.1,
-            'temperature': F.softplus(self.head_temperature(h)) + 0.1,
+            'lr_C1': torch.sigmoid(self.head_lr(h)) * 0.1,
+            'temperature': F.softplus(self.head_temp(h)) + 0.1,
             'mom_a': torch.sigmoid(self.head_mom_a(h)),
             'mom_t': torch.sigmoid(self.head_mom_t(h)),
-            'mig_thresh': torch.sigmoid(self.head_mig_thresh(h)),
-            'gain_scale': torch.sigmoid(self.head_gain_scale(h)),
-            'heal_scale': torch.sigmoid(self.head_heal_scale(h)),
+            'mig_thresh': torch.sigmoid(self.head_mig(h)),
+            'gain_scale': torch.sigmoid(self.head_gain(h)),
+            'heal_scale': torch.sigmoid(self.head_heal(h)),
             'basal_bonus': F.softplus(self.head_basal_bonus(h)),
             'basal_lr': torch.sigmoid(self.head_basal_lr(h)) * 0.01
         }
@@ -164,19 +82,30 @@ class Critic(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim * 3, dim),
-            nn.ReLU(),
+            nn.Linear(dim * 3, dim), nn.ReLU(),
             nn.Linear(dim, 1)
         )
     def forward(self, anchor, target, C0):
-        return self.net(torch.cat([anchor, target, C0])).squeeze(-1)
+        return self.net(torch.cat([anchor, target, C0], dim=-1)).squeeze(-1)
 
+class ActionHead(nn.Module):
+    def __init__(self, dim, basal_dim, modal_dim):
+        super().__init__()
+        total_out = basal_dim + modal_dim
+        self.net = nn.Linear(dim * 2, total_out)  # C0 и target
+    def forward(self, C0, target):
+        return self.net(torch.cat([C0, target], dim=-1))
+
+# ------------------------------------------------------------
+# Основной модуль
+# ------------------------------------------------------------
 class ZazorLayer(nn.Module):
     def __init__(self, config: ZazorConfig):
         super().__init__()
-        self.cfg = config
         d, c, a = config.dim, config.core_size, config.archive_size
+        self.cfg = config
 
+        # Память
         self.C1 = nn.Parameter(torch.zeros(c, d))
         self.C2 = nn.Parameter(torch.zeros(a, d))
         self.anchor = nn.Parameter(torch.zeros(d))
@@ -187,120 +116,150 @@ class ZazorLayer(nn.Module):
         self.ages_arch = nn.Parameter(torch.zeros(a))
         self.sacred_mu = nn.Parameter(torch.zeros(c))
         self.sacred_sigma2 = nn.Parameter(torch.ones(c))
-        self.gamma = nn.Parameter(torch.tensor(0.5))
+        # Шрамы как тензор напряжений между слотами C1
+        self.T = nn.Parameter(torch.zeros(c, c))
 
+        # Базальные слоты
         self.register_buffer('is_basal', torch.zeros(c, dtype=torch.bool))
-        self.is_basal[:config.num_basal_slots] = True
-        if config.initial_persona is not None:
-            with torch.no_grad():
-                self.C1[:config.num_basal_slots] = config.initial_persona.unsqueeze(0)
+        self.is_basal[:config.num_basal] = True
+        # Ортогональная инициализация базальных слотов
+        with torch.no_grad():
+            base = torch.randn(config.num_basal, d)
+            base = torch.linalg.qr(base.T)[0].T  # ортогонализация
+            self.C1[:config.num_basal] = base * 0.1
 
-        self.theta = nn.Linear(2 * d, d)
-        self.gate_W = nn.Linear(2 * d, d)
-        self.mixer = Mixer(d, c, a, config.mixer)
+        # Сети
+        self.theta = Theta(d)
+        self.gate = Gate(d)
+        self.mixer = Mixer(d, c)
         self.critic = Critic(d)
+        self.action = ActionHead(d, config.basal_dim, d)  # выход аффекта + модальности
 
-        self.register_buffer('S', torch.zeros(0, d))
-        self.register_buffer('sig', torch.zeros(0))
-        self.register_buffer('nov', torch.zeros(0))
+        # Для хранения предыдущего состояния
+        self.prev_C0 = None
+        self.prev_S_true = None
 
-    def persona(self):
-        return self.C1.mean(dim=0)
+    def compute_energy(self, C0, target, anchor, C1, is_basal, T, gamma, S_true, V_pred, drift, paranoia, gap):
+        # Энергия когерентности
+        E_coh = torch.sum((C0 - target)**2) + self.cfg.alpha_coh * drift
+        # Работа критика
+        E_work = (S_true - V_pred)**2 * (1 + torch.norm(C0 - target))
+        # Регуляризация
+        E_reg = self.cfg.alpha_reg * torch.sum(T**2)
+        # Барьеры
+        E_barrier = torch.relu(drift - self.cfg.barrier_drift)**2 + torch.relu(paranoia - self.cfg.barrier_paranoia)**2
+        E_barrier = self.cfg.alpha_barrier * E_barrier
+        return E_coh + E_work + E_reg + E_barrier
 
-    def bias_from_scars(self):
-        if self.S.size(0) == 0:
-            return torch.zeros(self.C1.size(0), device=self.C1.device)
-        sim = F.cosine_similarity(self.S.unsqueeze(1), self.C1.unsqueeze(0), dim=-1)
-        bias = (self.sig.unsqueeze(-1) * (1 - self.nov.unsqueeze(-1)) * sim).sum(dim=0)
-        return bias * 0.1
+    def gamma_fixed_point(self, coh_vec, energy_fn, ctx, C1, is_basal, T, S_true, V_pred, drift, paranoia, gap,
+                          C0, target, anchor):
+        # Начальное приближение гаммы
+        gamma = torch.tensor(0.5, device=C0.device)
+        for _ in range(self.cfg.inner_gamma_steps):
+            gamma = gamma.detach().clone().requires_grad_(True)
+            energy = energy_fn(C0, target, anchor, C1, is_basal, T, gamma, S_true, V_pred, drift, paranoia, gap)
+            grad = torch.autograd.grad(energy, gamma, create_graph=False)[0]
+            gamma = gamma - self.cfg.gamma_lr * grad
+            gamma = torch.sigmoid(gamma)  # удерживаем в [0,1]
+        return gamma.detach()
 
-    def forward(self, K: torch.Tensor, F: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, K: torch.Tensor, F: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         d = self.cfg.dim
-        ctx = compute_context(K, F, self.anchor, self.gap, self.theta)
+        # Контекст
+        ctx = self.theta(K, F)
+        bridged = torch.sigmoid(self.gap) * ctx + (1 - torch.sigmoid(self.gap)) * K + self.anchor
+        ctx = bridged
 
+        # Вычисление текущих когомологий
+        persona = self.C1[self.is_basal].mean(dim=0)  # упрощённая персона
         drift_tension = (1 - F.cosine_similarity(self.anchor, self.target, dim=0)) * \
-                        (1 - F.cosine_similarity(self.anchor, self.persona(), dim=0)) * \
-                        (1 - F.cosine_similarity(self.persona(), self.target, dim=0))
+                        (1 - F.cosine_similarity(self.anchor, persona, dim=0)) * \
+                        (1 - F.cosine_similarity(persona, self.target, dim=0))
         trauma_mean = self.trauma.mean()
         avg_variance = self.sacred_sigma2.mean()
-        if self.S.size(0) > 0:
-            paranoia = (self.sig * (1 - self.nov)).sum() / self.S.size(0)
+        # Паранойя из тензора T: сумма абсолютных значений T, нормированная
+        paranoia = torch.sum(torch.abs(self.T)) / (self.T.numel() + 1e-8)
+        avg_sacred = (self.sacred_mu + self.bias_from_T()).mean()
+        gap_val = self.gap.squeeze()
+
+        # Прогноз критика и реальная удовлетворённость
+        C0_temp = ctx  # временно, будет пересчитан после гейта
+        V_pred = self.critic(self.anchor, self.target, C0_temp)
+        # S_true будет вычислен после формирования C0, но для энергии используем предыдущий или оцениваем
+        if self.prev_C0 is not None:
+            S_true = F.cosine_similarity(self.prev_C0, self.target, dim=0)
         else:
-            paranoia = torch.tensor(0.0)
-        critic_error = torch.tensor(0.0)
-        avg_sacred_eff = (self.sacred_mu + self.bias_from_scars()).mean()
-        cohom_vec = torch.stack([
-            drift_tension, trauma_mean, self.gap.squeeze(), avg_variance,
-            critic_error, avg_sacred_eff, paranoia
-        ])
-        gamma = compute_gamma(drift_tension, trauma_mean, self.gap.squeeze(), avg_variance,
-                              critic_error, avg_sacred_eff, self.cfg.cohomology)
-        self.gamma.data = gamma
+            S_true = torch.tensor(0.5, device=ctx.device)
 
-        params = self.mixer(cohom_vec.detach())
+        coh_vec = torch.stack([drift_tension, trauma_mean, gap_val, avg_variance,
+                               torch.zeros(1, device=ctx.device), avg_sacred])  # critic_error пока 0
 
-        mem_contrib, attn, freshness = boundary_1(ctx, self.C1, self.is_basal,
-                                                   params['temperature'], params['basal_bonus'],
-                                                   gamma, paranoia, self.ages)
+        # Параметры от миксера
+        params = self.mixer(coh_vec)
 
+        # Внимание ∂₁
+        logits = (ctx @ self.C1.T) / (params['temperature'] + 1e-8)
+        crisis_bonus = self.is_basal.float() * params['basal_bonus'] * ((1 - self.gamma) + paranoia)
+        attn = torch.softmax(logits + crisis_bonus, dim=-1)
+        mem_contrib = attn @ self.C1
+        freshness = torch.exp(-self.ages * (1 + self.gamma))
+
+        # Гейт
+        confidence_mem = avg_sacred * (1 - paranoia) * self.gamma
         novelty = 1 - F.cosine_similarity(ctx, mem_contrib, dim=0)
-        C0 = gate_mix(ctx, mem_contrib, self.gate_W, gamma, paranoia, avg_sacred_eff, novelty)
+        confidence_ctx = (1 - self.gamma) * (1 + paranoia) * novelty
+        C0 = self.gate(ctx, mem_contrib, confidence_mem, confidence_ctx)
 
-        trust = gamma * (1 - paranoia)
-        C1_new = update_C1(self.C1, C0, attn, params['lr_C1'], trust, self.is_basal, params['basal_lr'])
-
-        bias = self.bias_from_scars()
-        sacred_eff = self.sacred_mu + bias
-        C1_new, C2_new = update_C2(self.C2, C1_new, self.ages, self.trauma, sacred_eff,
-                                   params['mig_thresh'], self.ages_arch, C0)
-
-        sim = F.cosine_similarity(C0.unsqueeze(0), self.C1, dim=-1)
-        novelty_vec = 1 - sim
-        heal_vec = F.cosine_similarity(self.C1, self.target.unsqueeze(0), dim=-1)
-        trauma_new = update_trauma(self.trauma, novelty_vec, heal_vec,
-                                   params['gain_scale'], params['heal_scale'])
-
-        ages_new = update_ages(self.ages, attn, sim, gamma, self.cfg.age)
-        ages_arch_new = self.ages_arch + self.cfg.age.delta_t
-
-        V_pred = self.critic(self.anchor, self.target, C0)
+        # Удовлетворённость фактическая
         S_true = F.cosine_similarity(C0, self.target, dim=0)
-        TD_error = S_true - V_pred.detach()
-        mu_new, sigma2_new, sacred_eff_new = update_sacred(self.sacred_mu, self.sacred_sigma2, attn,
-                                                           TD_error, trust, bias)
+        V_pred = self.critic(self.anchor, self.target, C0)
+        critic_error = torch.abs(S_true - V_pred)
 
-        anchor_new = params['mom_a'] * self.anchor + (1 - params['mom_a']) * C0
-        target_new = params['mom_t'] * self.target + (1 - params['mom_t']) * anchor_new
+        # Энергия (для обучения параметров)
+        energy = self.compute_energy(C0, self.target, self.anchor, self.C1, self.is_basal, self.T, self.gamma,
+                                     S_true, V_pred, drift_tension, paranoia, gap_val)
 
-        S_new, sig_new, nov_new = update_error_sheaf(self.S, self.sig, self.nov, self.anchor,
-                                                     self.cfg.error_sheaf)
-        if S_true < 0.7:
-            S_new = torch.cat([S_new, C0.detach().unsqueeze(0)])
-            sig_new = torch.cat([sig_new, (1 - S_true).unsqueeze(0)])
-            nov_new = torch.cat([nov_new, torch.ones(1, device=nov_new.device)])
-            if S_new.size(0) > self.cfg.error_sheaf.max_scars:
-                idx = torch.argmin(sig_new)
-                mask = torch.ones(S_new.size(0), dtype=torch.bool)
-                mask[idx] = False
-                S_new, sig_new, nov_new = S_new[mask], sig_new[mask], nov_new[mask]
-
-        self.C1.data = C1_new
-        self.C2.data = C2_new
-        self.anchor.data = anchor_new
-        self.target.data = target_new
-        self.trauma.data = trauma_new
-        self.ages.data = ages_new
-        self.ages_arch.data = ages_arch_new
-        self.sacred_mu.data = mu_new
-        self.sacred_sigma2.data = sigma2_new
-        self.S.data = S_new
-        self.sig.data = sig_new
-        self.nov.data = nov_new
-
-        return C0, S_true
-
-    def warmup(self, steps=None):
-        steps = steps or self.cfg.warmup_steps
+        # Градиентный шаг по всем параметрам (кроме гаммы) — делаем через оптимизатор вручную
+        # Здесь для краткости покажем, как обновляются основные параметры через градиенты энергии
+        grads = torch.autograd.grad(energy, [self.C1, self.C2, self.anchor, self.target, self.trauma,
+                                             self.ages, self.ages_arch, self.sacred_mu, self.sacred_sigma2, self.T],
+                                    create_graph=False)
+        lr = self.cfg.base_lr
         with torch.no_grad():
-            for _ in range(steps):
-                self.forward(torch.zeros(self.cfg.dim), torch.zeros(self.cfg.dim))
+            self.C1 -= lr * grads[0]
+            self.C2 -= lr * grads[1]
+            self.anchor -= lr * grads[2]
+            self.target -= lr * grads[3]
+            self.trauma -= lr * grads[4]
+            self.ages -= lr * grads[5]
+            self.ages_arch -= lr * grads[6]
+            self.sacred_mu -= lr * grads[7]
+            self.sacred_sigma2 -= lr * grads[8]
+            self.T -= lr * grads[9]
+
+        self.gamma = self.gamma_fixed_point(coh_vec, self.compute_energy, ctx, self.C1, self.is_basal, self.T,
+                                            S_true, V_pred, drift_tension, paranoia, gap_val, C0, self.target, self.anchor)
+
+        affective_out = self.action(C0, self.target)
+
+        self.prev_C0 = C0.detach()
+        self.prev_S_true = S_true.detach()
+
+        return C0, S_true, affective_out
+
+    def bias_from_T(self):
+        # Смещение sacred от напряжений шрамов: bias_i = sum_j T_ij * (средняя активация слота j?)
+        # Для простоты используем текущие attn (приблизительно)
+        # В реальности нужно хранить attn или использовать равномерное
+        return torch.sum(self.T, dim=1) * 0.1
+
+    def diagnostics(self):
+        return {
+            'gamma': self.gamma.item(),
+            'drift_tension': (1 - F.cosine_similarity(self.anchor, self.target, dim=0)).item(),
+            'trauma_mean': self.trauma.mean().item(),
+            'paranoia': torch.sum(torch.abs(self.T)).item() / self.T.numel(),
+            'avg_sacred': (self.sacred_mu + self.bias_from_T()).mean().item(),
+            'gap': self.gap.item(),
+            'T_norm': torch.norm(self.T).item()
+        }
