@@ -1,30 +1,47 @@
+"""
+ZazorLayer — Голографический Осьминог
+Единый файл: мотивная сфера, цветной поток Риччи, хирургия, микросон.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
 # ------------------------------------------------------------
-# Конфигурация (минимальная)
+# Конфигурация
 # ------------------------------------------------------------
 class ZazorConfig:
-    def __init__(self, dim: int, core_size: int = 16, archive_size: int = 32,
-                 num_basal: int = 4, basal_dim: int = 4):
-        self.dim = dim
-        self.core_size = core_size
-        self.archive_size = archive_size
+    def __init__(self, motive_dim: int = 64, max_slots: int = 128,
+                 num_basal: int = 4, basal_dim: int = 4, top_k: int = 16):
+        # Мотивное пространство
+        self.motive_dim = motive_dim
+        self.max_slots = max_slots
         self.num_basal = num_basal
-        self.basal_dim = basal_dim  # размерность аффективного выхода
-        # Параметры энергии
-        self.alpha_coh = 1.0
-        self.alpha_work = 0.5
-        self.alpha_reg = 0.01
-        self.alpha_barrier = 10.0
-        self.barrier_drift = 0.5
-        self.barrier_paranoia = 0.5
-        # Оптимизация
-        self.inner_gamma_steps = 3
-        self.gamma_lr = 0.01
-        self.base_lr = 0.001
+        self.basal_dim = basal_dim
+
+        # Поток Риччи и метрика
+        self.alpha_T = 1.0          # коэффициент в exp(-α * dist^2)
+        self.lr_ricci = 0.01        # шаг потока для slot_motives
+        self.lr_color = 0.01        # шаг для slot_colors
+        self.lambda_sphere = 0.1    # удержание на сфере (не используется, т.к. явная проекция)
+
+        # Хирургия
+        self.surgery_thresh = 0.8   # T_ij > этого → кандидат
+        self.surgery_dist = 0.1     # расстояние < этого → можно слить
+        self.max_surgery_per_step = 1
+
+        # Внимание и гейт
+        self.temperature = 0.5      # базовая температура внимания
+        self.gamma_R0 = 0.1         # целевая скалярная кривизна
+        self.gamma_beta = 5.0       # крутизна сигмоиды
+
+        # Память
+        self.top_k = top_k          # для разреженной T
+        self.use_sparse = True      # использовать ли top_k
+
+        # Микросон
+        self.dream_steps = 1        # шагов за один микросон
 
 # ------------------------------------------------------------
 # Вспомогательные слои
@@ -46,38 +63,6 @@ class Gate(nn.Module):
         gate = torch.sigmoid(raw + logit_mod)
         return gate * mem_contrib + (1 - gate) * ctx
 
-class Mixer(nn.Module):
-    def __init__(self, dim, core_size):
-        super().__init__()
-        input_dim = 6  # drift, trauma_mean, gap, avg_variance, critic_error, avg_sacred
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU()
-        )
-        self.head_lr = nn.Linear(64, core_size)
-        self.head_temp = nn.Linear(64, 1)
-        self.head_mom_a = nn.Linear(64, 1)
-        self.head_mom_t = nn.Linear(64, 1)
-        self.head_mig = nn.Linear(64, 1)
-        self.head_gain = nn.Linear(64, dim)
-        self.head_heal = nn.Linear(64, dim)
-        self.head_basal_bonus = nn.Linear(64, 1)
-        self.head_basal_lr = nn.Linear(64, 1)
-
-    def forward(self, coh):
-        h = self.net(coh)
-        return {
-            'lr_C1': torch.sigmoid(self.head_lr(h)) * 0.1,
-            'temperature': F.softplus(self.head_temp(h)) + 0.1,
-            'mom_a': torch.sigmoid(self.head_mom_a(h)),
-            'mom_t': torch.sigmoid(self.head_mom_t(h)),
-            'mig_thresh': torch.sigmoid(self.head_mig(h)),
-            'gain_scale': torch.sigmoid(self.head_gain(h)),
-            'heal_scale': torch.sigmoid(self.head_heal(h)),
-            'basal_bonus': F.softplus(self.head_basal_bonus(h)),
-            'basal_lr': torch.sigmoid(self.head_basal_lr(h)) * 0.01
-        }
-
 class Critic(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -89,10 +74,9 @@ class Critic(nn.Module):
         return self.net(torch.cat([anchor, target, C0], dim=-1)).squeeze(-1)
 
 class ActionHead(nn.Module):
-    def __init__(self, dim, basal_dim, modal_dim):
+    def __init__(self, dim, basal_dim):
         super().__init__()
-        total_out = basal_dim + modal_dim
-        self.net = nn.Linear(dim * 2, total_out)  # C0 и target
+        self.net = nn.Linear(dim * 2, basal_dim + dim)
     def forward(self, C0, target):
         return self.net(torch.cat([C0, target], dim=-1))
 
@@ -102,164 +86,220 @@ class ActionHead(nn.Module):
 class ZazorLayer(nn.Module):
     def __init__(self, config: ZazorConfig):
         super().__init__()
-        d, c, a = config.dim, config.core_size, config.archive_size
         self.cfg = config
+        d = config.motive_dim
 
-        # Память
-        self.C1 = nn.Parameter(torch.zeros(c, d))
-        self.C2 = nn.Parameter(torch.zeros(a, d))
+        # Мотивная сфера: параметры слотов (нормированные векторы)
+        self.slot_motives = nn.Parameter(torch.randn(config.max_slots, d))
+        with torch.no_grad():
+            self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
+
+        # Цвета слотов: явный срез пучка (RGB)
+        self.slot_colors = nn.Parameter(torch.rand(config.max_slots, 3) * 0.1)
+        # Базальные слоты получают чистые базовые цвета
+        with torch.no_grad():
+            if config.num_basal >= 3:
+                self.slot_colors[0] = torch.tensor([1.0, 0.0, 0.0])  # красный
+                self.slot_colors[1] = torch.tensor([0.0, 1.0, 0.0])  # зелёный
+                self.slot_colors[2] = torch.tensor([0.0, 0.0, 1.0])  # синий
+                if config.num_basal >= 4:
+                    self.slot_colors[3] = torch.tensor([1.0, 1.0, 0.0])  # жёлтый
+
+        # Маски активности и базальности
+        self.register_buffer('active_mask', torch.ones(config.max_slots, dtype=torch.bool))
+        self.register_buffer('is_basal', torch.zeros(config.max_slots, dtype=torch.bool))
+        self.is_basal[:config.num_basal] = True
+
+        # Параметры контекстного тракта
         self.anchor = nn.Parameter(torch.zeros(d))
         self.target = nn.Parameter(torch.zeros(d))
         self.gap = nn.Parameter(torch.zeros(1))
-        self.trauma = nn.Parameter(torch.zeros(c))
-        self.ages = nn.Parameter(torch.zeros(c))
-        self.ages_arch = nn.Parameter(torch.zeros(a))
-        self.sacred_mu = nn.Parameter(torch.zeros(c))
-        self.sacred_sigma2 = nn.Parameter(torch.ones(c))
-        # Шрамы как тензор напряжений между слотами C1
-        self.T = nn.Parameter(torch.zeros(c, c))
-
-        # Базальные слоты
-        self.register_buffer('is_basal', torch.zeros(c, dtype=torch.bool))
-        self.is_basal[:config.num_basal] = True
-        # Ортогональная инициализация базальных слотов
-        with torch.no_grad():
-            base = torch.randn(config.num_basal, d)
-            base = torch.linalg.qr(base.T)[0].T  # ортогонализация
-            self.C1[:config.num_basal] = base * 0.1
 
         # Сети
         self.theta = Theta(d)
         self.gate = Gate(d)
-        self.mixer = Mixer(d, c)
         self.critic = Critic(d)
-        self.action = ActionHead(d, config.basal_dim, d)  # выход аффекта + модальности
+        self.action = ActionHead(d, config.basal_dim)
 
-        # Для хранения предыдущего состояния
-        self.prev_C0 = None
-        self.prev_S_true = None
+        # Состояние
+        self.gamma = 0.5
 
-    def compute_energy(self, C0, target, anchor, C1, is_basal, T, gamma, S_true, V_pred, drift, paranoia, gap):
-        # Энергия когерентности
-        E_coh = torch.sum((C0 - target)**2) + self.cfg.alpha_coh * drift
-        # Работа критика
-        E_work = (S_true - V_pred)**2 * (1 + torch.norm(C0 - target))
-        # Регуляризация
-        E_reg = self.cfg.alpha_reg * torch.sum(T**2)
-        # Барьеры
-        E_barrier = torch.relu(drift - self.cfg.barrier_drift)**2 + torch.relu(paranoia - self.cfg.barrier_paranoia)**2
-        E_barrier = self.cfg.alpha_barrier * E_barrier
-        return E_coh + E_work + E_reg + E_barrier
+    # --------------------------------------------------------
+    # Вычисление метрики T (разреженной или полной)
+    # --------------------------------------------------------
+    def compute_T(self, motives, colors):
+        N = motives.shape[0]
+        # Косинусные близости: (N, N)
+        cos_sim = motives @ motives.T
+        dist_sq = 2.0 - 2.0 * cos_sim  # геодезическое расстояние на сфере
 
-    def gamma_fixed_point(self, coh_vec, energy_fn, ctx, C1, is_basal, T, S_true, V_pred, drift, paranoia, gap,
-                          C0, target, anchor):
-        # Начальное приближение гаммы
-        gamma = torch.tensor(0.5, device=C0.device)
-        for _ in range(self.cfg.inner_gamma_steps):
-            gamma = gamma.detach().clone().requires_grad_(True)
-            energy = energy_fn(C0, target, anchor, C1, is_basal, T, gamma, S_true, V_pred, drift, paranoia, gap)
-            grad = torch.autograd.grad(energy, gamma, create_graph=False)[0]
-            gamma = gamma - self.cfg.gamma_lr * grad
-            gamma = torch.sigmoid(gamma)  # удерживаем в [0,1]
-        return gamma.detach()
+        # Цветовое напряжение: разница в красном канале (травма)
+        trauma = colors[:, 0]
+        trauma_diff = torch.abs(trauma.unsqueeze(0) - trauma.unsqueeze(1))
 
-    def forward(self, K: torch.Tensor, F: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        d = self.cfg.dim
-        # Контекст
-        ctx = self.theta(K, F)
-        bridged = torch.sigmoid(self.gap) * ctx + (1 - torch.sigmoid(self.gap)) * K + self.anchor
-        ctx = bridged
+        T_full = torch.exp(-self.cfg.alpha_T * dist_sq) * (1.0 + trauma_diff)
 
-        # Вычисление текущих когомологий
-        persona = self.C1[self.is_basal].mean(dim=0)  # упрощённая персона
-        drift_tension = (1 - F.cosine_similarity(self.anchor, self.target, dim=0)) * \
-                        (1 - F.cosine_similarity(self.anchor, persona, dim=0)) * \
-                        (1 - F.cosine_similarity(persona, self.target, dim=0))
-        trauma_mean = self.trauma.mean()
-        avg_variance = self.sacred_sigma2.mean()
-        # Паранойя из тензора T: сумма абсолютных значений T, нормированная
-        paranoia = torch.sum(torch.abs(self.T)) / (self.T.numel() + 1e-8)
-        avg_sacred = (self.sacred_mu + self.bias_from_T()).mean()
-        gap_val = self.gap.squeeze()
+        if self.cfg.use_sparse:
+            # Оставляем только top_k ближайших соседей для каждой вершины
+            topk_vals, topk_idx = torch.topk(cos_sim, self.cfg.top_k, dim=1)
+            mask = torch.zeros_like(T_full)
+            mask.scatter_(1, topk_idx, 1.0)
+            T_full = T_full * mask
+        return T_full
 
-        # Прогноз критика и реальная удовлетворённость
-        C0_temp = ctx  # временно, будет пересчитан после гейта
-        V_pred = self.critic(self.anchor, self.target, C0_temp)
-        # S_true будет вычислен после формирования C0, но для энергии используем предыдущий или оцениваем
-        if self.prev_C0 is not None:
-            S_true = F.cosine_similarity(self.prev_C0, self.target, dim=0)
+    # --------------------------------------------------------
+    # Скалярная кривизна и гамма
+    # --------------------------------------------------------
+    def compute_gamma(self, T, colors):
+        # Локальная кривизна: R_i = sum_j T_ij * ||color_i - color_j||^2
+        color_diff = (colors.unsqueeze(1) - colors.unsqueeze(0)).pow(2).sum(dim=2)  # (N,N)
+        R_i = (T * color_diff).sum(dim=1)
+        R = R_i.mean()
+        gamma = torch.sigmoid(self.cfg.gamma_beta * (R - self.cfg.gamma_R0))
+        return gamma, R
+
+    # --------------------------------------------------------
+    # Хирургия: слияние двух близких слотов
+    # --------------------------------------------------------
+    def surgery(self, motives, colors, T):
+        N = motives.shape[0]
+        # Ищем активные слоты
+        active = self.active_mask.nonzero(as_tuple=True)[0]
+        if len(active) < 2:
+            return motives, colors, False
+
+        # Маска близких точек
+        cos_sim = motives[active] @ motives[active].T
+        dist_sq = 2.0 - 2.0 * cos_sim
+        close_mask = dist_sq < self.cfg.surgery_dist
+        # Не рассматриваем диагональ
+        close_mask = close_mask & ~torch.eye(len(active), device=motives.device, dtype=torch.bool)
+
+        if close_mask.sum() == 0:
+            return motives, colors, False
+
+        # Выбираем пару с максимальным T_ij среди близких
+        T_sub = T[active][:, active]
+        # Зануляем те, где не близки
+        T_sub = T_sub * close_mask.float()
+        max_val, max_idx = T_sub.max(dim=1)
+        max_val_global, row = max_val.max(dim=0)
+        col = max_idx[row]
+
+        if max_val_global < self.cfg.surgery_thresh:
+            return motives, colors, False
+
+        i = active[row].item()
+        j = active[col].item()
+
+        # Слияние: средний мотив, нормализованный
+        new_motive = F.normalize((motives[i] + motives[j]) / 2.0, dim=0)
+        new_color = (colors[i] + colors[j]) / 2.0
+
+        # Заменяем i-й слот новым, j-й деактивируем
+        motives = motives.clone()
+        colors = colors.clone()
+        motives[i] = new_motive
+        colors[i] = new_color
+        self.active_mask[j] = False
+
+        # При необходимости переносим базальность, если один из них был базальным
+        if self.is_basal[j]:
+            self.is_basal[i] = True
+        self.is_basal[j] = False
+
+        return motives, colors, True
+
+    # --------------------------------------------------------
+    # Основной forward
+    # --------------------------------------------------------
+    def forward(self, K: torch.Tensor, F: torch.Tensor,
+                dream_mode: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if dream_mode:
+            # Микросон: нулевые входы, контекст = персона
+            persona = self.slot_motives[self.is_basal].mean(dim=0, keepdim=True)
+            K = torch.zeros_like(K)
+            F = torch.zeros_like(F)
+            ctx = persona.squeeze(0)
         else:
-            S_true = torch.tensor(0.5, device=ctx.device)
+            ctx = self.theta(K, F)
 
-        coh_vec = torch.stack([drift_tension, trauma_mean, gap_val, avg_variance,
-                               torch.zeros(1, device=ctx.device), avg_sacred])  # critic_error пока 0
+        # Шаг 0: нормируем мотивы (на всякий случай)
+        with torch.no_grad():
+            self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
 
-        # Параметры от миксера
-        params = self.mixer(coh_vec)
+        # Вычисляем метрику T и кривизну
+        T = self.compute_T(self.slot_motives, self.slot_colors)
+        gamma, R = self.compute_gamma(T, self.slot_colors)
+        self.gamma = gamma.item()
 
-        # Внимание ∂₁
-        logits = (ctx @ self.C1.T) / (params['temperature'] + 1e-8)
-        crisis_bonus = self.is_basal.float() * params['basal_bonus'] * ((1 - self.gamma) + paranoia)
-        attn = torch.softmax(logits + crisis_bonus, dim=-1)
-        mem_contrib = attn @ self.C1
-        freshness = torch.exp(-self.ages * (1 + self.gamma))
+        # Внимание и гейт
+        temperature = self.cfg.temperature * (1.0 + gamma)
+        logits = (ctx @ self.slot_motives.T) / temperature
+        # Бонус базальным слотам
+        basal_bonus = self.is_basal.float() * gamma * 0.5
+        attn = torch.softmax(logits + basal_bonus, dim=-1)
+        mem_contrib = attn @ self.slot_motives
 
-        # Гейт
-        confidence_mem = avg_sacred * (1 - paranoia) * self.gamma
-        novelty = 1 - F.cosine_similarity(ctx, mem_contrib, dim=0)
-        confidence_ctx = (1 - self.gamma) * (1 + paranoia) * novelty
+        # Уверенности
+        confidence_mem = gamma * (1.0 - R / (R + 1.0))
+        novelty = 1.0 - F.cosine_similarity(ctx, mem_contrib, dim=0)
+        confidence_ctx = (1.0 - gamma) * novelty
+
         C0 = self.gate(ctx, mem_contrib, confidence_mem, confidence_ctx)
 
-        # Удовлетворённость фактическая
+        # Удовлетворённость
         S_true = F.cosine_similarity(C0, self.target, dim=0)
         V_pred = self.critic(self.anchor, self.target, C0)
-        critic_error = torch.abs(S_true - V_pred)
 
-        # Энергия (для обучения параметров)
-        energy = self.compute_energy(C0, self.target, self.anchor, self.C1, self.is_basal, self.T, self.gamma,
-                                     S_true, V_pred, drift_tension, paranoia, gap_val)
+        # Энергия для потока Риччи
+        energy = self.compute_ricci_energy(T, self.slot_colors)
 
-        # Градиентный шаг по всем параметрам (кроме гаммы) — делаем через оптимизатор вручную
-        # Здесь для краткости покажем, как обновляются основные параметры через градиенты энергии
-        grads = torch.autograd.grad(energy, [self.C1, self.C2, self.anchor, self.target, self.trauma,
-                                             self.ages, self.ages_arch, self.sacred_mu, self.sacred_sigma2, self.T],
-                                    create_graph=False)
-        lr = self.cfg.base_lr
+        # Градиентный шаг для мотивов
+        grad_motives = torch.autograd.grad(energy, self.slot_motives, create_graph=False)[0]
         with torch.no_grad():
-            self.C1 -= lr * grads[0]
-            self.C2 -= lr * grads[1]
-            self.anchor -= lr * grads[2]
-            self.target -= lr * grads[3]
-            self.trauma -= lr * grads[4]
-            self.ages -= lr * grads[5]
-            self.ages_arch -= lr * grads[6]
-            self.sacred_mu -= lr * grads[7]
-            self.sacred_sigma2 -= lr * grads[8]
-            self.T -= lr * grads[9]
+            self.slot_motives -= self.cfg.lr_ricci * grad_motives
+            self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
 
-        self.gamma = self.gamma_fixed_point(coh_vec, self.compute_energy, ctx, self.C1, self.is_basal, self.T,
-                                            S_true, V_pred, drift_tension, paranoia, gap_val, C0, self.target, self.anchor)
+        # Градиентный шаг для цветов
+        grad_colors = torch.autograd.grad(energy, self.slot_colors, create_graph=False)[0]
+        with torch.no_grad():
+            self.slot_colors -= self.cfg.lr_color * grad_colors
+            self.slot_colors.clamp_(0.0, 1.0)
 
+        # Хирургия
+        self.slot_motives.data, self.slot_colors.data, _ = self.surgery(
+            self.slot_motives.data, self.slot_colors.data, T
+        )
+
+        # Аффективный выход
         affective_out = self.action(C0, self.target)
-
-        self.prev_C0 = C0.detach()
-        self.prev_S_true = S_true.detach()
 
         return C0, S_true, affective_out
 
-    def bias_from_T(self):
-        # Смещение sacred от напряжений шрамов: bias_i = sum_j T_ij * (средняя активация слота j?)
-        # Для простоты используем текущие attn (приблизительно)
-        # В реальности нужно хранить attn или использовать равномерное
-        return torch.sum(self.T, dim=1) * 0.1
+    # --------------------------------------------------------
+    # Энергия потока Риччи (цветовая)
+    # --------------------------------------------------------
+    def compute_ricci_energy(self, T, colors):
+        # E = sum_{i,j} T_ij * ||c_i - c_j||^2
+        diff = (colors.unsqueeze(1) - colors.unsqueeze(0)).pow(2).sum(dim=2)
+        return (T * diff).sum()
 
+    # --------------------------------------------------------
+    # Микросон: просто вызов forward с dream_mode=True
+    # --------------------------------------------------------
+    def microsleep(self, steps: int = None):
+        if steps is None:
+            steps = self.cfg.dream_steps
+        for _ in range(steps):
+            self.forward(torch.zeros(self.cfg.motive_dim), torch.zeros(self.cfg.motive_dim), dream_mode=True)
+
+    # --------------------------------------------------------
+    # Диагностика
+    # --------------------------------------------------------
     def diagnostics(self):
         return {
-            'gamma': self.gamma.item(),
-            'drift_tension': (1 - F.cosine_similarity(self.anchor, self.target, dim=0)).item(),
-            'trauma_mean': self.trauma.mean().item(),
-            'paranoia': torch.sum(torch.abs(self.T)).item() / self.T.numel(),
-            'avg_sacred': (self.sacred_mu + self.bias_from_T()).mean().item(),
-            'gap': self.gap.item(),
-            'T_norm': torch.norm(self.T).item()
+            'gamma': self.gamma,
+            'active_slots': self.active_mask.sum().item(),
+            'basal_active': self.is_basal.sum().item(),
         }
