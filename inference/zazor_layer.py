@@ -1,52 +1,54 @@
 """
-ZazorLayer — Голографический Осьминог
-Единый файл: мотивная сфера, цветной поток Риччи, хирургия, микросон.
+ZazorLayer — Спектральный Осьминог с относительным временем
+Непрерывный поток, цветовые гармоники, многошкальная временная иерархия.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Tuple, Optional
 
 # ------------------------------------------------------------
 # Конфигурация
 # ------------------------------------------------------------
 class ZazorConfig:
-    def __init__(self, motive_dim: int = 64, max_slots: int = 128,
-                 num_basal: int = 4, basal_dim: int = 4, top_k: int = 16):
-        # Мотивное пространство
+    def __init__(
+        self,
+        motive_dim: int = 64,       # размерность мотивного пространства
+        max_slots: int = 128,       # максимум слотов памяти
+        num_basal: int = 4,         # количество базальных слотов
+        basal_dim: int = 4,         # размерность аффективного выхода
+        top_k: int = 16,            # разреженность метрики T
+        color_dim: int = 9,         # размерность спектра (2*K+1)
+        time_window: int = 32,      # максимальная длина буфера истории
+        base_temperature: float = 0.5,
+        alpha_T: float = 1.0,
+        beta_resonance: float = 1.0,
+        lr_ricci: float = 0.01,
+        lr_color: float = 0.01,
+        surgery_thresh: float = 0.8,
+        surgery_dist: float = 0.1,
+    ):
         self.motive_dim = motive_dim
         self.max_slots = max_slots
         self.num_basal = num_basal
         self.basal_dim = basal_dim
-
-        # Поток Риччи и метрика
-        self.alpha_T = 1.0          # коэффициент в exp(-α * dist^2)
-        self.lr_ricci = 0.01        # шаг потока для slot_motives
-        self.lr_color = 0.01        # шаг для slot_colors
-        self.lambda_sphere = 0.1    # удержание на сфере (не используется, т.к. явная проекция)
-
-        # Хирургия
-        self.surgery_thresh = 0.8   # T_ij > этого → кандидат
-        self.surgery_dist = 0.1     # расстояние < этого → можно слить
-        self.max_surgery_per_step = 1
-
-        # Внимание и гейт
-        self.temperature = 0.5      # базовая температура внимания
-        self.gamma_R0 = 0.1         # целевая скалярная кривизна
-        self.gamma_beta = 5.0       # крутизна сигмоиды
-
-        # Память
-        self.top_k = top_k          # для разреженной T
-        self.use_sparse = True      # использовать ли top_k
-
-        # Микросон
-        self.dream_steps = 1        # шагов за один микросон
+        self.top_k = top_k
+        self.color_dim = color_dim
+        self.time_window = time_window
+        self.base_temperature = base_temperature
+        self.alpha_T = alpha_T
+        self.beta_resonance = beta_resonance
+        self.lr_ricci = lr_ricci
+        self.lr_color = lr_color
+        self.surgery_thresh = surgery_thresh
+        self.surgery_dist = surgery_dist
 
 # ------------------------------------------------------------
-# Вспомогательные слои
+# Вспомогательные модули
 # ------------------------------------------------------------
 class Theta(nn.Module):
+    """Объединение K и F в контекст."""
     def __init__(self, dim):
         super().__init__()
         self.net = nn.Linear(2 * dim, dim)
@@ -54,26 +56,25 @@ class Theta(nn.Module):
         return self.net(torch.cat([K, F], dim=-1))
 
 class Gate(nn.Module):
+    """Ворота: смешивание контекста и памяти."""
     def __init__(self, dim):
         super().__init__()
         self.W = nn.Linear(2 * dim, dim)
-    def forward(self, ctx, mem_contrib, confidence_mem, confidence_ctx):
-        logit_mod = torch.log(confidence_mem / (confidence_ctx + 1e-8))
-        raw = self.W(torch.cat([ctx, mem_contrib], dim=-1))
-        gate = torch.sigmoid(raw + logit_mod)
-        return gate * mem_contrib + (1 - gate) * ctx
+    def forward(self, ctx, mem, conf_mem, conf_ctx):
+        logit = torch.log(conf_mem / (conf_ctx + 1e-8))
+        gate = torch.sigmoid(self.W(torch.cat([ctx, mem], dim=-1)) + logit)
+        return gate * mem + (1 - gate) * ctx
 
 class Critic(nn.Module):
+    """Предсказатель удовлетворённости."""
     def __init__(self, dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim * 3, dim), nn.ReLU(),
-            nn.Linear(dim, 1)
-        )
+        self.net = nn.Sequential(nn.Linear(dim * 3, dim), nn.ReLU(), nn.Linear(dim, 1))
     def forward(self, anchor, target, C0):
         return self.net(torch.cat([anchor, target, C0], dim=-1)).squeeze(-1)
 
 class ActionHead(nn.Module):
+    """Формирует базальный аффект и модальный выход."""
     def __init__(self, dim, basal_dim):
         super().__init__()
         self.net = nn.Linear(dim * 2, basal_dim + dim)
@@ -81,29 +82,32 @@ class ActionHead(nn.Module):
         return self.net(torch.cat([C0, target], dim=-1))
 
 # ------------------------------------------------------------
-# Основной модуль
+# Основной слой
 # ------------------------------------------------------------
 class ZazorLayer(nn.Module):
     def __init__(self, config: ZazorConfig):
         super().__init__()
         self.cfg = config
         d = config.motive_dim
+        cdim = config.color_dim
 
-        # Мотивная сфера: параметры слотов (нормированные векторы)
-        self.slot_motives = nn.Parameter(torch.randn(config.max_slots, d))
+        # Мотивная сфера
+        self.slot_motives = nn.Parameter(F.normalize(torch.randn(config.max_slots, d), dim=1))
+        # Спектральные цвета (коэффициенты Фурье)
+        self.slot_spectra = nn.Parameter(torch.rand(config.max_slots, cdim) * 0.1)
+        # Инициализация базальных спектров чистыми гармониками
         with torch.no_grad():
-            self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
+            for i in range(min(config.num_basal, config.max_slots)):
+                # Одна активная гармоника с номером i+1
+                self.slot_spectra[i, 0] = 0.5               # постоянная составляющая
+                if cdim > 1 and i*2+1 < cdim:
+                    self.slot_spectra[i, 2*i+1] = 0.8       # косинусная гармоника
+                if cdim > 2 and i*2+2 < cdim:
+                    self.slot_spectra[i, 2*i+2] = 0.4       # синусная гармоника
 
-        # Цвета слотов: явный срез пучка (RGB)
-        self.slot_colors = nn.Parameter(torch.rand(config.max_slots, 3) * 0.1)
-        # Базальные слоты получают чистые базовые цвета
-        with torch.no_grad():
-            if config.num_basal >= 3:
-                self.slot_colors[0] = torch.tensor([1.0, 0.0, 0.0])  # красный
-                self.slot_colors[1] = torch.tensor([0.0, 1.0, 0.0])  # зелёный
-                self.slot_colors[2] = torch.tensor([0.0, 0.0, 1.0])  # синий
-                if config.num_basal >= 4:
-                    self.slot_colors[3] = torch.tensor([1.0, 1.0, 0.0])  # жёлтый
+        # Временные масштабы для каждого слота (логарифмически равномерно)
+        self.time_scales = nn.Parameter(torch.logspace(-1, 1, config.max_slots))
+        self.time_scales.requires_grad = False  # фиксируем, но можно обучать
 
         # Маски активности и базальности
         self.register_buffer('active_mask', torch.ones(config.max_slots, dtype=torch.bool))
@@ -113,7 +117,6 @@ class ZazorLayer(nn.Module):
         # Параметры контекстного тракта
         self.anchor = nn.Parameter(torch.zeros(d))
         self.target = nn.Parameter(torch.zeros(d))
-        self.gap = nn.Parameter(torch.zeros(1))
 
         # Сети
         self.theta = Theta(d)
@@ -121,185 +124,191 @@ class ZazorLayer(nn.Module):
         self.critic = Critic(d)
         self.action = ActionHead(d, config.basal_dim)
 
-        # Состояние
-        self.gamma = 0.5
+        # Буфер истории (циклический)
+        self.register_buffer('history_ptr', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('history', torch.zeros(config.time_window, d))
 
-    # --------------------------------------------------------
-    # Вычисление метрики T (разреженной или полной)
-    # --------------------------------------------------------
-    def compute_T(self, motives, colors):
-        N = motives.shape[0]
-        # Косинусные близости: (N, N)
-        cos_sim = motives @ motives.T
-        dist_sq = 2.0 - 2.0 * cos_sim  # геодезическое расстояние на сфере
+    # ------------------------------------------------------------
+    # Добавление фрейма в историю
+    # ------------------------------------------------------------
+    def push_frame(self, frame):
+        idx = self.history_ptr.item() % self.cfg.time_window
+        self.history[idx] = frame
+        self.history_ptr += 1
 
-        # Цветовое напряжение: разница в красном канале (травма)
-        trauma = colors[:, 0]
-        trauma_diff = torch.abs(trauma.unsqueeze(0) - trauma.unsqueeze(1))
+    # ------------------------------------------------------------
+    # Извлечение контекста и входного спектра с учётом time_scales
+    # ------------------------------------------------------------
+    def get_temporal_context(self):
+        """Возвращает общий контекст ctx и входной спектр input_spectrum,
+        используя взвешенное внимание по времени с разными масштабами для каждого слота."""
+        T = min(self.history_ptr.item(), self.cfg.time_window)
+        if T == 0:
+            # Нет истории — возвращаем нули
+            return torch.zeros(self.cfg.motive_dim), torch.zeros(self.cfg.color_dim)
 
-        T_full = torch.exp(-self.cfg.alpha_T * dist_sq) * (1.0 + trauma_diff)
+        hist = self.history[:T]  # (T, d)
+        # Временные метки (чем ближе к текущему, тем больше t)
+        t = torch.arange(T, dtype=torch.float32) - (T - 1)  # от -(T-1) до 0
 
-        if self.cfg.use_sparse:
-            # Оставляем только top_k ближайших соседей для каждой вершины
-            topk_vals, topk_idx = torch.topk(cos_sim, self.cfg.top_k, dim=1)
-            mask = torch.zeros_like(T_full)
-            mask.scatter_(1, topk_idx, 1.0)
-            T_full = T_full * mask
-        return T_full
+        # Для каждого слота вычисляем веса softmax(-|t| / scale_i)
+        scales = self.time_scales.unsqueeze(1)  # (N, 1)
+        t_expanded = t.unsqueeze(0)  # (1, T)
+        # Внимание: чем дальше в прошлое, тем меньше вес
+        logits = -torch.abs(t_expanded) / (scales + 1e-8)  # (N, T)
+        weights = torch.softmax(logits, dim=1)  # (N, T)
 
-    # --------------------------------------------------------
-    # Скалярная кривизна и гамма
-    # --------------------------------------------------------
-    def compute_gamma(self, T, colors):
-        # Локальная кривизна: R_i = sum_j T_ij * ||color_i - color_j||^2
-        color_diff = (colors.unsqueeze(1) - colors.unsqueeze(0)).pow(2).sum(dim=2)  # (N,N)
-        R_i = (T * color_diff).sum(dim=1)
-        R = R_i.mean()
-        gamma = torch.sigmoid(self.cfg.gamma_beta * (R - self.cfg.gamma_R0))
-        return gamma, R
+        # Контекст для каждого слота: weights @ hist
+        slot_contexts = weights @ hist  # (N, d)
 
-    # --------------------------------------------------------
-    # Хирургия: слияние двух близких слотов
-    # --------------------------------------------------------
-    def surgery(self, motives, colors, T):
-        N = motives.shape[0]
-        # Ищем активные слоты
+        # Общий контекст — средневзвешенное по слотам с учётом time_scale (быстрые слоты вносят больший вклад в текущий момент)
+        # Веса для смешивания контекстов: softmax(scales) или просто нормированные scales
+        mix_weights = torch.softmax(scales.squeeze(), dim=0)  # (N,)
+        ctx = (mix_weights.unsqueeze(0) @ slot_contexts).squeeze(0)  # (d,)
+
+        # Входной спектр: усредняем цветовые компоненты по истории с общим (медианным) масштабом
+        median_scale = scales.median()
+        global_weights = torch.softmax(-torch.abs(t) / (median_scale + 1e-8), dim=0)  # (T,)
+        input_spectrum = global_weights @ hist[:, :self.cfg.color_dim]  # (color_dim,)
+        return ctx, input_spectrum
+
+    # ------------------------------------------------------------
+    # Резонансная метрика T
+    # ------------------------------------------------------------
+    def compute_T(self, motives, spectra, input_spectrum):
+        # Геодезическое расстояние на сфере
+        cos = motives @ motives.T
+        dist_sq = 2.0 - 2.0 * cos
+        T_base = torch.exp(-self.cfg.alpha_T * dist_sq)
+
+        # Спектральное напряжение: используем L2-разность спектров (травма = амплитуда первой гармоники?)
+        spec_diff = torch.sum((spectra.unsqueeze(1) - spectra.unsqueeze(0))**2, dim=2)  # (N,N)
+        T_color = T_base * (1.0 + spec_diff)
+
+        # Резонанс с входным спектром
+        resonance = torch.exp(-torch.sum((spectra - input_spectrum.unsqueeze(0))**2, dim=1))  # (N,)
+        T_resonance = self.cfg.beta_resonance * torch.outer(resonance, resonance)
+        T = T_color * (1.0 + T_resonance)
+
+        # Разреженность через top_k
+        if self.cfg.top_k:
+            top_vals, top_idx = torch.topk(cos, min(self.cfg.top_k, cos.shape[0]), dim=1)
+            mask = torch.zeros_like(T)
+            mask.scatter_(1, top_idx, 1.0)
+            T = T * mask
+        return T
+
+    # ------------------------------------------------------------
+    # Хирургия
+    # ------------------------------------------------------------
+    def surgery(self, motives, spectra, T):
         active = self.active_mask.nonzero(as_tuple=True)[0]
         if len(active) < 2:
-            return motives, colors, False
+            return motives, spectra
 
-        # Маска близких точек
-        cos_sim = motives[active] @ motives[active].T
-        dist_sq = 2.0 - 2.0 * cos_sim
-        close_mask = dist_sq < self.cfg.surgery_dist
-        # Не рассматриваем диагональ
-        close_mask = close_mask & ~torch.eye(len(active), device=motives.device, dtype=torch.bool)
+        # Матрица близости по мотивам
+        cos_active = motives[active] @ motives[active].T
+        dist_sq_active = 2.0 - 2.0 * cos_active
+        close = (dist_sq_active < self.cfg.surgery_dist) & ~torch.eye(len(active), device=cos_active.device, dtype=torch.bool)
 
-        if close_mask.sum() == 0:
-            return motives, colors, False
+        if not close.any():
+            return motives, spectra
 
-        # Выбираем пару с максимальным T_ij среди близких
-        T_sub = T[active][:, active]
-        # Зануляем те, где не близки
-        T_sub = T_sub * close_mask.float()
+        T_sub = T[active][:, active] * close.float()
         max_val, max_idx = T_sub.max(dim=1)
-        max_val_global, row = max_val.max(dim=0)
+        val, row = max_val.max(dim=0)
         col = max_idx[row]
-
-        if max_val_global < self.cfg.surgery_thresh:
-            return motives, colors, False
+        if val < self.cfg.surgery_thresh:
+            return motives, spectra
 
         i = active[row].item()
         j = active[col].item()
 
-        # Слияние: средний мотив, нормализованный
+        # Слияние
         new_motive = F.normalize((motives[i] + motives[j]) / 2.0, dim=0)
-        new_color = (colors[i] + colors[j]) / 2.0
+        new_spectrum = (spectra[i] + spectra[j]) / 2.0
 
-        # Заменяем i-й слот новым, j-й деактивируем
         motives = motives.clone()
-        colors = colors.clone()
+        spectra = spectra.clone()
         motives[i] = new_motive
-        colors[i] = new_color
+        spectra[i] = new_spectrum
         self.active_mask[j] = False
 
-        # При необходимости переносим базальность, если один из них был базальным
+        # Перенос базальности
         if self.is_basal[j]:
             self.is_basal[i] = True
         self.is_basal[j] = False
 
-        return motives, colors, True
+        return motives, spectra
 
-    # --------------------------------------------------------
-    # Основной forward
-    # --------------------------------------------------------
-    def forward(self, K: torch.Tensor, F: torch.Tensor,
-                dream_mode: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if dream_mode:
-            # Микросон: нулевые входы, контекст = персона
-            persona = self.slot_motives[self.is_basal].mean(dim=0, keepdim=True)
-            K = torch.zeros_like(K)
-            F = torch.zeros_like(F)
-            ctx = persona.squeeze(0)
-        else:
-            ctx = self.theta(K, F)
+    # ------------------------------------------------------------
+    # Энергия потока Риччи
+    # ------------------------------------------------------------
+    def ricci_energy(self, T, spectra):
+        diff = torch.sum((spectra.unsqueeze(1) - spectra.unsqueeze(0))**2, dim=2)
+        return (T * diff).sum()
 
-        # Шаг 0: нормируем мотивы (на всякий случай)
+    # ------------------------------------------------------------
+    # Основной шаг (принимает один фрейм потока)
+    # ------------------------------------------------------------
+    def forward(self, frame: torch.Tensor, dream: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if dream:
+            # Сон: вход = персона (среднее базальных)
+            persona = self.slot_motives[self.is_basal].mean(dim=0)
+            frame = torch.zeros_like(persona)
+            # В истории оставляем нули, либо можно аккумулировать сны отдельно
+        self.push_frame(frame)
+        ctx, input_spectrum = self.get_temporal_context()
+
+        # Нормировка мотивов
         with torch.no_grad():
             self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
 
-        # Вычисляем метрику T и кривизну
-        T = self.compute_T(self.slot_motives, self.slot_colors)
-        gamma, R = self.compute_gamma(T, self.slot_colors)
-        self.gamma = gamma.item()
+        # Метрика T
+        T = self.compute_T(self.slot_motives, self.slot_spectra, input_spectrum)
 
-        # Внимание и гейт
-        temperature = self.cfg.temperature * (1.0 + gamma)
+        # Резонанс для внимания и гейта
+        resonance = torch.exp(-torch.sum((self.slot_spectra - input_spectrum.unsqueeze(0))**2, dim=1))
+        temperature = self.cfg.base_temperature * (1.0 + resonance.mean())
+
+        # Внимание
         logits = (ctx @ self.slot_motives.T) / temperature
-        # Бонус базальным слотам
-        basal_bonus = self.is_basal.float() * gamma * 0.5
+        basal_bonus = self.is_basal.float() * 0.1
         attn = torch.softmax(logits + basal_bonus, dim=-1)
+
+        # Память и гейт
         mem_contrib = attn @ self.slot_motives
-
-        # Уверенности
-        confidence_mem = gamma * (1.0 - R / (R + 1.0))
-        novelty = 1.0 - F.cosine_similarity(ctx, mem_contrib, dim=0)
-        confidence_ctx = (1.0 - gamma) * novelty
-
-        C0 = self.gate(ctx, mem_contrib, confidence_mem, confidence_ctx)
+        conf_mem = resonance.mean()
+        conf_ctx = 1.0 - F.cosine_similarity(ctx, mem_contrib, dim=0)
+        C0 = self.gate(ctx, mem_contrib, conf_mem, conf_ctx)
 
         # Удовлетворённость
         S_true = F.cosine_similarity(C0, self.target, dim=0)
-        V_pred = self.critic(self.anchor, self.target, C0)
 
-        # Энергия для потока Риччи
-        energy = self.compute_ricci_energy(T, self.slot_colors)
+        # Энергия Риччи и градиенты
+        E = self.ricci_energy(T, self.slot_spectra)
+        grad_m = torch.autograd.grad(E, self.slot_motives, create_graph=False)[0]
+        grad_s = torch.autograd.grad(E, self.slot_spectra, create_graph=False)[0]
 
-        # Градиентный шаг для мотивов
-        grad_motives = torch.autograd.grad(energy, self.slot_motives, create_graph=False)[0]
         with torch.no_grad():
-            self.slot_motives -= self.cfg.lr_ricci * grad_motives
+            self.slot_motives -= self.cfg.lr_ricci * grad_m
             self.slot_motives.data = F.normalize(self.slot_motives.data, dim=1)
-
-        # Градиентный шаг для цветов
-        grad_colors = torch.autograd.grad(energy, self.slot_colors, create_graph=False)[0]
-        with torch.no_grad():
-            self.slot_colors -= self.cfg.lr_color * grad_colors
-            self.slot_colors.clamp_(0.0, 1.0)
+            self.slot_spectra -= self.cfg.lr_color * grad_s
+            self.slot_spectra.clamp_(0.0, 1.0)
 
         # Хирургия
-        self.slot_motives.data, self.slot_colors.data, _ = self.surgery(
-            self.slot_motives.data, self.slot_colors.data, T
+        self.slot_motives.data, self.slot_spectra.data = self.surgery(
+            self.slot_motives.data, self.slot_spectra.data, T
         )
 
-        # Аффективный выход
+        # Аффективный выход и глобальное время
         affective_out = self.action(C0, self.target)
+        global_affect = torch.norm(affective_out[:self.cfg.basal_dim])  # базальная часть
+        return C0, S_true, affective_out, global_affect
 
-        return C0, S_true, affective_out
-
-    # --------------------------------------------------------
-    # Энергия потока Риччи (цветовая)
-    # --------------------------------------------------------
-    def compute_ricci_energy(self, T, colors):
-        # E = sum_{i,j} T_ij * ||c_i - c_j||^2
-        diff = (colors.unsqueeze(1) - colors.unsqueeze(0)).pow(2).sum(dim=2)
-        return (T * diff).sum()
-
-    # --------------------------------------------------------
-    # Микросон: просто вызов forward с dream_mode=True
-    # --------------------------------------------------------
-    def microsleep(self, steps: int = None):
-        if steps is None:
-            steps = self.cfg.dream_steps
+    # ------------------------------------------------------------
+    # Микросон (несколько шагов сна)
+    # ------------------------------------------------------------
+    def microsleep(self, steps: int = 1):
         for _ in range(steps):
-            self.forward(torch.zeros(self.cfg.motive_dim), torch.zeros(self.cfg.motive_dim), dream_mode=True)
-
-    # --------------------------------------------------------
-    # Диагностика
-    # --------------------------------------------------------
-    def diagnostics(self):
-        return {
-            'gamma': self.gamma,
-            'active_slots': self.active_mask.sum().item(),
-            'basal_active': self.is_basal.sum().item(),
-        }
+            self.forward(torch.zeros(self.cfg.motive_dim), dream=True)
